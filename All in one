@@ -1,0 +1,900 @@
+-- All-in-One GUI v4 (with Unload)
+-- Fly / Click TP / No Ragdoll / Noclip / Inf Jump / Godmode / ESP / Speed / Fullbright / Anti-AFK
+-- Saved locations + coordinates, rebindable keys, ON/OFF switches, saved config
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RS = game:GetService("RunService")
+local TS = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+local lp = Players.LocalPlayer
+local mouse = lp:GetMouse()
+
+-- unload previous copy if this script was already executed
+local genv = (getgenv and getgenv()) or _G
+if genv.AIO_UNLOAD then pcall(genv.AIO_UNLOAD) end
+
+-- connection tracking (everything tracked here gets disconnected on unload)
+local conns = {}
+local unloaded = false
+local function track(c) conns[#conns + 1] = c return c end
+
+---------------------------------------------------------------- CONFIG
+local FILE = "AllInOneGUI.json"
+local defaults = {
+    ToggleGUI = Enum.KeyCode.RightShift,
+    Fly       = Enum.KeyCode.F,
+    FlyUp     = Enum.KeyCode.E,
+    FlyDown   = Enum.KeyCode.Q,
+    ClickTP   = Enum.KeyCode.LeftControl, -- hold + click
+    NoRagdoll = Enum.KeyCode.N,
+    Noclip    = Enum.KeyCode.V,
+    InfJump   = Enum.KeyCode.J,
+    Godmode   = Enum.KeyCode.G,
+    ESP       = Enum.KeyCode.B,
+    Speed     = Enum.KeyCode.C,
+    Fullbright= Enum.KeyCode.L,
+    AntiAFK   = false,
+    QuickSave = Enum.KeyCode.K,
+    Unload    = false,
+}
+local binds = {}
+for k, v in pairs(defaults) do binds[k] = v end
+
+local flySpeed, walkSpeed = 60, 50
+local placeKey = tostring(game.PlaceId)
+local allLocations = {}          -- [placeId] = { {name,x,y,z}, ... }
+local listening = nil
+local refreshers, bindBtns = {}, {}
+local function refreshAll() for _, f in ipairs(refreshers) do f() end end
+local function keyName(k) return k and k.Name or "None" end
+local function down(k) return k and UIS:IsKeyDown(k) end
+
+local function save()
+    if not writefile then return end
+    pcall(function()
+        local t = {binds = {}, flySpeed = flySpeed, walkSpeed = walkSpeed, locations = allLocations}
+        for k, v in pairs(binds) do t.binds[k] = v and v.Name or "" end
+        writefile(FILE, HttpService:JSONEncode(t))
+    end)
+end
+
+if isfile and readfile then
+    pcall(function()
+        if isfile(FILE) then
+            local t = HttpService:JSONDecode(readfile(FILE))
+            for k, v in pairs(t.binds or {}) do
+                if defaults[k] ~= nil then
+                    if v == "" then binds[k] = false
+                    else
+                        local okk, kc = pcall(function() return Enum.KeyCode[v] end)
+                        if okk and kc then binds[k] = kc end
+                    end
+                end
+            end
+            if tonumber(t.flySpeed) then flySpeed = math.clamp(t.flySpeed, 1, 500) end
+            if tonumber(t.walkSpeed) then walkSpeed = math.clamp(t.walkSpeed, 1, 500) end
+            if type(t.locations) == "table" then allLocations = t.locations end
+        end
+    end)
+end
+allLocations[placeKey] = allLocations[placeKey] or {}
+local locations = allLocations[placeKey]
+
+---------------------------------------------------------------- STATE
+local flying, clickTPEnabled, noRagdoll, noclip, infJump = false, true, false, false, false
+local godmode, espOn, speedOn, fbOn, antiAFK = false, false, false, false, false
+local espFolder
+local rebuildLocList
+local unload
+
+local function getHum() local c = lp.Character return c and c:FindFirstChildOfClass("Humanoid") end
+local function getRoot() local c = lp.Character return c and c:FindFirstChild("HumanoidRootPart") end
+local function teleportTo(pos)       -- drops you slightly above the target
+    local c = lp.Character
+    if c then c:PivotTo(CFrame.new(pos + Vector3.new(0, 3, 0))) end
+end
+local function teleportExact(pos)
+    local c = lp.Character
+    if c then c:PivotTo(CFrame.new(pos)) end
+end
+
+---------------------------------------------------------------- FLY
+local flyBV, flyBG, flyConn
+local function stopFly()
+    flying = false
+    if flyConn then flyConn:Disconnect() flyConn = nil end
+    if flyBV then flyBV:Destroy() flyBV = nil end
+    if flyBG then flyBG:Destroy() flyBG = nil end
+    local hum = getHum()
+    if hum then hum.PlatformStand = false end
+    refreshAll()
+end
+
+local function startFly()
+    local root, hum = getRoot(), getHum()
+    if not root or not hum or hum.Health <= 0 then return end
+    if flying then return end
+    flying = true
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = root
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    flyBG.P = 9e4
+    flyBG.CFrame = root.CFrame
+    flyBG.Parent = root
+    hum.PlatformStand = true
+
+    flyConn = RS.RenderStepped:Connect(function()
+        local cam = workspace.CurrentCamera
+        local r, h = getRoot(), getHum()
+        if not r or not h or h.Health <= 0 or not cam then return stopFly() end
+        local look = cam.CFrame.LookVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        flatLook = flatLook.Magnitude > 0 and flatLook.Unit or Vector3.new(0, 0, -1)
+        local right = cam.CFrame.RightVector
+        local flatRight = Vector3.new(right.X, 0, right.Z).Unit
+        local m = h.MoveDirection
+        local dir = look * m:Dot(flatLook) + right * m:Dot(flatRight)
+        if down(binds.FlyUp) then dir += Vector3.new(0, 1, 0) end
+        if down(binds.FlyDown) then dir -= Vector3.new(0, 1, 0) end
+        flyBV.Velocity = dir * flySpeed
+        flyBG.CFrame = CFrame.new(r.Position, r.Position + look)
+    end)
+    refreshAll()
+end
+local function setFly(v) if v then startFly() else stopFly() end end
+
+---------------------------------------------------------------- NO RAGDOLL
+local ragdollConns = {}
+local function clearRagdollConns()
+    for _, c in ipairs(ragdollConns) do c:Disconnect() end
+    table.clear(ragdollConns)
+end
+
+local function applyNoRagdoll(char)
+    clearRagdollConns()
+    if not noRagdoll or not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    table.insert(ragdollConns, hum.StateChanged:Connect(function(_, new)
+        if not noRagdoll then return end
+        if hum.Health <= 0 or new == Enum.HumanoidStateType.Dead then return end
+        local bad = new == Enum.HumanoidStateType.Ragdoll
+            or new == Enum.HumanoidStateType.FallingDown
+            or (new == Enum.HumanoidStateType.PlatformStanding and not flying)
+        if bad then
+            hum.PlatformStand = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then root.Anchored = false end
+        end
+    end))
+    table.insert(ragdollConns, hum.Died:Connect(clearRagdollConns))
+end
+
+local function setNoRagdoll(v)
+    noRagdoll = v
+    if v then
+        applyNoRagdoll(lp.Character)
+    else
+        clearRagdollConns()
+        local hum = getHum()
+        if hum then
+            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        end
+    end
+    refreshAll()
+end
+
+---------------------------------------------------------------- NOCLIP
+local noclipOrig = {}
+local noclipConn
+local function setNoclip(v)
+    noclip = v
+    if noclipConn then noclipConn:Disconnect() noclipConn = nil end
+    if v then
+        noclipConn = RS.Stepped:Connect(function()
+            local h = getHum()
+            if not h or h.Health <= 0 then return end
+            local c = lp.Character
+            if not c then return end
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") then
+                    if noclipOrig[p] == nil then noclipOrig[p] = p.CanCollide end
+                    p.CanCollide = false
+                end
+            end
+        end)
+    else
+        for p, orig in pairs(noclipOrig) do
+            if p.Parent then p.CanCollide = orig end
+        end
+        table.clear(noclipOrig)
+    end
+    refreshAll()
+end
+
+---------------------------------------------------------------- INF JUMP
+track(UIS.JumpRequest:Connect(function()
+    if infJump then
+        local hum = getHum()
+        if hum and hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end))
+local function setInfJump(v) infJump = v refreshAll() end
+
+---------------------------------------------------------------- GODMODE (client-side only!)
+local godConn
+local function applyGod(char)
+    if godConn then godConn:Disconnect() godConn = nil end
+    if not godmode or not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    godConn = hum.HealthChanged:Connect(function(h)
+        if godmode and h > 0 and h < hum.MaxHealth then
+            hum.Health = hum.MaxHealth
+        end
+    end)
+    if hum.Health > 0 then hum.Health = hum.MaxHealth end
+end
+local function setGod(v)
+    godmode = v
+    if v then
+        applyGod(lp.Character)
+    elseif godConn then
+        godConn:Disconnect() godConn = nil
+    end
+    refreshAll()
+end
+
+---------------------------------------------------------------- SPEED
+local speedConn, origSpeed
+local function setSpeed(v)
+    speedOn = v
+    if speedConn then speedConn:Disconnect() speedConn = nil end
+    local hum = getHum()
+    if v then
+        if hum then origSpeed = hum.WalkSpeed end
+        speedConn = RS.Heartbeat:Connect(function()
+            local h = getHum()
+            if h and h.Health > 0 then h.WalkSpeed = walkSpeed end
+        end)
+    else
+        if hum and origSpeed then hum.WalkSpeed = origSpeed end
+        origSpeed = nil
+    end
+    refreshAll()
+end
+
+---------------------------------------------------------------- FULLBRIGHT
+local fbConn, lightOrig
+local function setFullbright(v)
+    fbOn = v
+    if fbConn then fbConn:Disconnect() fbConn = nil end
+    if v then
+        lightOrig = {
+            Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime,
+            FogEnd = Lighting.FogEnd, GlobalShadows = Lighting.GlobalShadows,
+            Ambient = Lighting.Ambient,
+        }
+        fbConn = RS.RenderStepped:Connect(function()
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 14
+            Lighting.FogEnd = 1e6
+            Lighting.GlobalShadows = false
+            Lighting.Ambient = Color3.fromRGB(178, 178, 178)
+        end)
+    elseif lightOrig then
+        for k, val in pairs(lightOrig) do Lighting[k] = val end
+        lightOrig = nil
+    end
+    refreshAll()
+end
+
+---------------------------------------------------------------- ANTI-AFK
+track(lp.Idled:Connect(function()
+    if antiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end
+end))
+local function setAntiAFK(v) antiAFK = v refreshAll() end
+
+---------------------------------------------------------------- ESP
+local espObjs = {}
+local espConn
+local function removeESP(p)
+    local o = espObjs[p]
+    if o then
+        o.hl:Destroy() o.bb:Destroy()
+        espObjs[p] = nil
+    end
+end
+
+local function buildESP(p)
+    if p == lp or espObjs[p] or not espFolder then return end
+    local ch = p.Character
+    local head = ch and ch:FindFirstChild("Head")
+    if not head then return end
+    local col = (p.Team and p.TeamColor.Color) or Color3.fromRGB(255, 70, 70)
+
+    local hl = Instance.new("Highlight")
+    hl.Adornee = ch
+    hl.FillColor = col
+    hl.FillTransparency = 0.65
+    hl.OutlineColor = Color3.new(1, 1, 1)
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = espFolder
+
+    local bb = Instance.new("BillboardGui")
+    bb.Adornee = head
+    bb.Size = UDim2.new(0, 170, 0, 34)
+    bb.StudsOffset = Vector3.new(0, 2.6, 0)
+    bb.AlwaysOnTop = true
+    bb.Parent = espFolder
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = col
+    lbl.TextStrokeTransparency = 0.3
+    lbl.Font = Enum.Font.SourceSansBold
+    lbl.TextSize = 15
+    lbl.Parent = bb
+
+    espObjs[p] = {hl = hl, bb = bb, lbl = lbl, char = ch}
+end
+
+local function updateESP()
+    local myRoot = getRoot()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then
+            local o = espObjs[p]
+            if o and o.char ~= p.Character then removeESP(p) o = nil end
+            if not o then buildESP(p) o = espObjs[p] end
+            if o then
+                local ch = p.Character
+                local root = ch and ch:FindFirstChild("HumanoidRootPart")
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                local dist = (root and myRoot) and math.floor((root.Position - myRoot.Position).Magnitude) or 0
+                local hp = hum and (" | " .. math.floor(hum.Health) .. " HP") or ""
+                o.lbl.Text = ("%s [%dm]%s"):format(p.DisplayName, dist, hp)
+            end
+        end
+    end
+end
+
+local function setESP(v)
+    espOn = v
+    if espConn then espConn:Disconnect() espConn = nil end
+    if v then
+        local t = 0
+        espConn = RS.Heartbeat:Connect(function(dt)
+            t += dt
+            if t >= 0.2 then t = 0 updateESP() end
+        end)
+        updateESP()
+    else
+        for p in pairs(espObjs) do removeESP(p) end
+    end
+    refreshAll()
+end
+track(Players.PlayerRemoving:Connect(removeESP))
+
+---------------------------------------------------------------- RESPAWN / DEATH
+local function onChar(char)
+    if unloaded then return end
+    stopFly()
+    table.clear(noclipOrig)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if hum then
+        track(hum.Died:Connect(function()
+            stopFly()
+            if noclip then setNoclip(false) end
+        end))
+    end
+    task.wait(0.5)
+    if unloaded then return end
+    applyNoRagdoll(char)
+    applyGod(char)
+end
+track(lp.CharacterAdded:Connect(onChar))
+if lp.Character then task.spawn(onChar, lp.Character) end
+
+---------------------------------------------------------------- LOCATIONS
+local function round1(n) return math.floor(n * 10 + 0.5) / 10 end
+local function saveLocation(name)
+    local root = getRoot()
+    if not root then return end
+    local p = root.Position
+    if not name or name == "" then name = "Spot " .. (#locations + 1) end
+    table.insert(locations, {name = name, x = round1(p.X), y = round1(p.Y), z = round1(p.Z)})
+    if rebuildLocList then rebuildLocList() end
+    save()
+end
+
+---------------------------------------------------------------- GUI BASE
+local gui = Instance.new("ScreenGui")
+gui.Name = "AllInOneGUI"
+gui.ResetOnSpawn = false
+local host
+do
+    local okH, p = pcall(function() return (gethui and gethui()) or game:GetService("CoreGui") end)
+    host = (okH and p) or lp:WaitForChild("PlayerGui")
+    for _, n in ipairs({"AllInOneGUI", "AIO_ESP"}) do
+        local old = host:FindFirstChild(n)
+        if old then old:Destroy() end
+    end
+end
+local okP = pcall(function() gui.Parent = host end)
+if not okP or not gui.Parent then host = lp:WaitForChild("PlayerGui") gui.Parent = host end
+espFolder = Instance.new("Folder")
+espFolder.Name = "AIO_ESP"
+espFolder.Parent = host
+
+---------------------------------------------------------------- UNLOAD
+unload = function()
+    if unloaded then return end
+    unloaded = true
+    -- switch every feature off so the game is restored to normal
+    pcall(setFly, false)
+    pcall(setNoRagdoll, false)
+    pcall(setNoclip, false)
+    pcall(setGod, false)
+    pcall(setESP, false)
+    pcall(setSpeed, false)
+    pcall(setFullbright, false)
+    infJump, antiAFK, clickTPEnabled = false, false, false
+    pcall(save)
+    -- disconnect everything the script hooked
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    table.clear(conns)
+    -- remove all UI / ESP objects
+    pcall(function() if espFolder then espFolder:Destroy() end end)
+    pcall(function() gui:Destroy() end)
+    if genv.AIO_UNLOAD == unload then genv.AIO_UNLOAD = nil end
+end
+genv.AIO_UNLOAD = unload
+
+local function corner(o, r) local c = Instance.new("UICorner", o) c.CornerRadius = UDim.new(0, r or 8) return c end
+local function mkButton(parent, text, size, pos, color)
+    local b = Instance.new("TextButton")
+    b.Size, b.Position = size, pos or UDim2.new()
+    b.BackgroundColor3 = color or Color3.fromRGB(45, 45, 55)
+    b.Text, b.TextColor3 = text, Color3.new(1, 1, 1)
+    b.Font, b.TextSize = Enum.Font.SourceSansBold, 18
+    b.AutoButtonColor = true
+    b.Parent = parent
+    corner(b, 6)
+    return b
+end
+local function mkLabel(parent, text, size, pos, ts, align)
+    local l = Instance.new("TextLabel")
+    l.Size, l.Position = size, pos or UDim2.new()
+    l.BackgroundTransparency = 1
+    l.Text, l.TextColor3 = text, Color3.new(1, 1, 1)
+    l.Font, l.TextSize = Enum.Font.SourceSansBold, ts or 17
+    l.TextXAlignment = align or Enum.TextXAlignment.Left
+    l.TextWrapped = true
+    l.Parent = parent
+    return l
+end
+local function mkBox(parent, text, size, pos, placeholder)
+    local b = Instance.new("TextBox")
+    b.Size, b.Position = size, pos or UDim2.new()
+    b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.PlaceholderColor3 = Color3.fromRGB(130, 130, 130)
+    b.PlaceholderText = placeholder or ""
+    b.Font, b.TextSize = Enum.Font.SourceSansBold, 16
+    b.Text = text or ""
+    b.ClearTextOnFocus = false
+    b.Parent = parent
+    corner(b, 6)
+    return b
+end
+
+-- Bubble
+local bubble = mkButton(gui, "_", UDim2.new(0, 50, 0, 50), UDim2.new(0.92, 0, 0.8, 0), Color3.new(0, 0, 0))
+bubble.TextColor3 = Color3.fromRGB(0, 255, 0)
+bubble.TextSize = 28
+corner(bubble, 25)
+TS:Create(bubble, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    {BackgroundColor3 = Color3.fromRGB(0, 60, 0)}):Play()
+
+-- Main frame
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 380, 0, 470)
+frame.Position = UDim2.new(0.5, -190, 0.5, -235)
+frame.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+frame.BackgroundTransparency = 0.05
+frame.Active = true
+frame.Parent = gui
+corner(frame, 10)
+
+local title = mkLabel(frame, "ALL-IN-ONE", UDim2.new(1, -50, 0, 36), UDim2.new(0, 12, 0, 0), 22)
+title.Active = true
+local closeBtn = mkButton(frame, "X", UDim2.new(0, 28, 0, 28), UDim2.new(1, -34, 0, 4), Color3.fromRGB(200, 40, 40))
+
+do -- drag by title
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, frame.Position
+            i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    track(UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+end
+
+local function setVisible(v) frame.Visible = v end
+bubble.MouseButton1Click:Connect(function() setVisible(not frame.Visible) end)
+closeBtn.MouseButton1Click:Connect(function() setVisible(false) end)
+
+---------------------------------------------------------------- TABS
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 32)
+tabBar.Position = UDim2.new(0, 10, 0, 40)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = frame
+local tl = Instance.new("UIListLayout", tabBar)
+tl.FillDirection = Enum.FillDirection.Horizontal
+tl.Padding = UDim.new(0, 5)
+
+local pages, tabButtons = {}, {}
+local function newPage(name, scrolling)
+    local p
+    if scrolling then
+        p = Instance.new("ScrollingFrame")
+        p.ScrollBarThickness = 5
+        p.BorderSizePixel = 0
+        p.CanvasSize = UDim2.new()
+        p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    else
+        p = Instance.new("Frame")
+    end
+    p.Size = UDim2.new(1, -20, 1, -85)
+    p.Position = UDim2.new(0, 10, 0, 78)
+    p.BackgroundTransparency = 1
+    p.Visible = false
+    p.Parent = frame
+    pages[name] = p
+    local b = mkButton(tabBar, name, UDim2.new(0.25, -4, 1, 0))
+    tabButtons[name] = b
+    b.MouseButton1Click:Connect(function()
+        for n, pg in pairs(pages) do
+            pg.Visible = (n == name)
+            tabButtons[n].BackgroundColor3 = (n == name) and Color3.fromRGB(0, 140, 70) or Color3.fromRGB(45, 45, 55)
+        end
+    end)
+    return p
+end
+local featPage = newPage("Features", true)
+local tpPage = newPage("Teleport")
+local playersPage = newPage("Players")
+local settingsPage = newPage("Settings", true)
+
+---------------------------------------------------------------- KEYBIND BUTTON
+local function createBindButton(parent, name, size, pos)
+    local btn = mkButton(parent, keyName(binds[name]), size, pos)
+    table.insert(bindBtns, {name = name, btn = btn})
+    btn.MouseButton1Click:Connect(function()
+        listening = name
+        btn.Text = "press key..."
+        btn.BackgroundColor3 = Color3.fromRGB(160, 120, 0)
+    end)
+    return btn
+end
+local function refreshBinds()
+    for _, e in ipairs(bindBtns) do
+        e.btn.Text = keyName(binds[e.name])
+        e.btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    end
+end
+
+---------------------------------------------------------------- FEATURES PAGE
+local fl = Instance.new("UIListLayout", featPage)
+fl.Padding = UDim.new(0, 6)
+
+local features = {
+    {label = "Fly",            bind = "Fly",        get = function() return flying end,          set = setFly,        toggleKey = true},
+    {label = "Click TP (hold key + click)", bind = "ClickTP", get = function() return clickTPEnabled end, set = function(v) clickTPEnabled = v refreshAll() end, toggleKey = false},
+    {label = "No Ragdoll",     bind = "NoRagdoll",  get = function() return noRagdoll end,       set = setNoRagdoll,  toggleKey = true},
+    {label = "Noclip",         bind = "Noclip",     get = function() return noclip end,          set = setNoclip,     toggleKey = true},
+    {label = "Infinite Jump",  bind = "InfJump",    get = function() return infJump end,         set = setInfJump,    toggleKey = true},
+    {label = "Godmode (client-side)", bind = "Godmode", get = function() return godmode end,     set = setGod,        toggleKey = true},
+    {label = "ESP",            bind = "ESP",        get = function() return espOn end,           set = setESP,        toggleKey = true},
+    {label = "Speed boost",    bind = "Speed",      get = function() return speedOn end,         set = setSpeed,      toggleKey = true},
+    {label = "Fullbright",     bind = "Fullbright", get = function() return fbOn end,            set = setFullbright, toggleKey = true},
+    {label = "Anti-AFK",       bind = "AntiAFK",    get = function() return antiAFK end,         set = setAntiAFK,    toggleKey = true},
+}
+
+for _, f in ipairs(features) do
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -8, 0, 42)
+    row.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    row.Parent = featPage
+    corner(row, 8)
+
+    local sw = mkButton(row, "OFF", UDim2.new(0, 56, 0, 30), UDim2.new(0, 6, 0.5, -15))
+    mkLabel(row, f.label, UDim2.new(1, -170, 1, 0), UDim2.new(0, 68, 0, 0), 15)
+    createBindButton(row, f.bind, UDim2.new(0, 84, 0, 30), UDim2.new(1, -90, 0.5, -15))
+
+    sw.MouseButton1Click:Connect(function() f.set(not f.get()) end)
+    table.insert(refreshers, function()
+        local on = f.get()
+        sw.Text = on and "ON" or "OFF"
+        sw.BackgroundColor3 = on and Color3.fromRGB(0, 150, 75) or Color3.fromRGB(110, 45, 45)
+    end)
+end
+
+local hint = mkLabel(featPage, "", UDim2.new(1, -8, 0, 62), nil, 14)
+hint.TextColor3 = Color3.fromRGB(160, 160, 160)
+hint.Font = Enum.Font.SourceSans
+hint.TextYAlignment = Enum.TextYAlignment.Top
+table.insert(refreshers, function()
+    hint.Text = ("Click ON/OFF or press the key. Click a key button to rebind (Esc = cancel, Backspace = none). GUI key: %s. Fly/Speed values are in Settings."):format(keyName(binds.ToggleGUI))
+end)
+
+---------------------------------------------------------------- TELEPORT PAGE
+local tlay = Instance.new("UIListLayout", tpPage)
+tlay.Padding = UDim.new(0, 6)
+
+local coordRow = Instance.new("Frame")
+coordRow.Size = UDim2.new(1, 0, 0, 32)
+coordRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+coordRow.Parent = tpPage
+corner(coordRow, 8)
+local coordLbl = mkLabel(coordRow, "X: -  Y: -  Z: -", UDim2.new(1, -80, 1, 0), UDim2.new(0, 10, 0, 0), 15)
+local copyBtn = mkButton(coordRow, "Copy", UDim2.new(0, 62, 0, 24), UDim2.new(1, -68, 0.5, -12))
+
+local lastCoords = ""
+do
+    local t = 0
+    track(RS.Heartbeat:Connect(function(dt)
+        t += dt
+        if t < 0.1 then return end
+        t = 0
+        local r = getRoot()
+        if r then
+            local p = r.Position
+            lastCoords = ("%.1f, %.1f, %.1f"):format(p.X, p.Y, p.Z)
+            coordLbl.Text = ("X: %.1f   Y: %.1f   Z: %.1f"):format(p.X, p.Y, p.Z)
+        end
+    end))
+end
+copyBtn.MouseButton1Click:Connect(function()
+    if setclipboard and lastCoords ~= "" then
+        pcall(setclipboard, lastCoords)
+        copyBtn.Text = "Copied!"
+        task.delay(1, function() copyBtn.Text = "Copy" end)
+    else
+        copyBtn.Text = "N/A"
+        task.delay(1, function() copyBtn.Text = "Copy" end)
+    end
+end)
+
+local saveRow = Instance.new("Frame")
+saveRow.Size = UDim2.new(1, 0, 0, 32)
+saveRow.BackgroundTransparency = 1
+saveRow.Parent = tpPage
+local nameBox = mkBox(saveRow, "", UDim2.new(1, -110, 1, 0), nil, "Location name")
+local saveBtn = mkButton(saveRow, "Save here", UDim2.new(0, 102, 1, 0), UDim2.new(1, -102, 0, 0), Color3.fromRGB(0, 130, 70))
+saveBtn.MouseButton1Click:Connect(function()
+    saveLocation(nameBox.Text)
+    nameBox.Text = ""
+end)
+
+local xyzRow = Instance.new("Frame")
+xyzRow.Size = UDim2.new(1, 0, 0, 32)
+xyzRow.BackgroundTransparency = 1
+xyzRow.Parent = tpPage
+local bx = mkBox(xyzRow, "", UDim2.new(0.22, -3, 1, 0), UDim2.new(0, 0, 0, 0), "X")
+local by = mkBox(xyzRow, "", UDim2.new(0.22, -3, 1, 0), UDim2.new(0.22, 2, 0, 0), "Y")
+local bz = mkBox(xyzRow, "", UDim2.new(0.22, -3, 1, 0), UDim2.new(0.44, 4, 0, 0), "Z")
+local goBtn = mkButton(xyzRow, "Go to XYZ", UDim2.new(0.34, -4, 1, 0), UDim2.new(0.66, 4, 0, 0), Color3.fromRGB(0, 110, 170))
+goBtn.MouseButton1Click:Connect(function()
+    local x, y, z = tonumber(bx.Text), tonumber(by.Text), tonumber(bz.Text)
+    if x and y and z then teleportExact(Vector3.new(x, y, z)) end
+end)
+
+local locScroll = Instance.new("ScrollingFrame")
+locScroll.Size = UDim2.new(1, 0, 0, 238)
+locScroll.BackgroundTransparency = 1
+locScroll.BorderSizePixel = 0
+locScroll.ScrollBarThickness = 5
+locScroll.CanvasSize = UDim2.new()
+locScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+locScroll.Parent = tpPage
+local ll = Instance.new("UIListLayout", locScroll)
+ll.Padding = UDim.new(0, 5)
+ll.SortOrder = Enum.SortOrder.LayoutOrder
+
+rebuildLocList = function()
+    for _, c in ipairs(locScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    for i, loc in ipairs(locations) do
+        local card = Instance.new("Frame")
+        card.Size = UDim2.new(1, -8, 0, 36)
+        card.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+        card.LayoutOrder = i
+        card.Parent = locScroll
+        corner(card, 6)
+        local nl = mkLabel(card, ("%s  (%.0f, %.0f, %.0f)"):format(loc.name, loc.x, loc.y, loc.z),
+            UDim2.new(1, -100, 1, 0), UDim2.new(0, 8, 0, 0), 14)
+        nl.TextTruncate = Enum.TextTruncate.AtEnd
+        local go = mkButton(card, "TP", UDim2.new(0, 40, 0, 26), UDim2.new(1, -88, 0.5, -13), Color3.fromRGB(0, 150, 75))
+        local del = mkButton(card, "X", UDim2.new(0, 34, 0, 26), UDim2.new(1, -44, 0.5, -13), Color3.fromRGB(170, 45, 45))
+        go.MouseButton1Click:Connect(function() teleportExact(Vector3.new(loc.x, loc.y, loc.z)) end)
+        del.MouseButton1Click:Connect(function()
+            table.remove(locations, i)
+            rebuildLocList()
+            save()
+        end)
+    end
+end
+rebuildLocList()
+
+---------------------------------------------------------------- PLAYERS PAGE
+local scroll = Instance.new("ScrollingFrame", playersPage)
+scroll.Size = UDim2.new(1, 0, 1, 0)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 6
+scroll.CanvasSize = UDim2.new()
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+local pl = Instance.new("UIListLayout", scroll)
+pl.Padding = UDim.new(0, 5)
+pl.SortOrder = Enum.SortOrder.Name
+
+local playerCards = {}
+local function addPlayer(p)
+    if p == lp or playerCards[p] then return end
+    local card = Instance.new("Frame")
+    card.Name = p.Name
+    card.Size = UDim2.new(1, -8, 0, 38)
+    card.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    card.Parent = scroll
+    corner(card, 6)
+    local nl = mkLabel(card, p.DisplayName .. " (@" .. p.Name .. ")", UDim2.new(0.7, 0, 1, 0), UDim2.new(0, 10, 0, 0), 16)
+    nl.TextTruncate = Enum.TextTruncate.AtEnd
+    local tp = mkButton(card, "TP", UDim2.new(0.2, 0, 0.8, 0), UDim2.new(0.77, 0, 0.1, 0), Color3.fromRGB(0, 160, 80))
+    tp.MouseButton1Click:Connect(function()
+        local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        if root then teleportTo(root.Position) end
+    end)
+    playerCards[p] = card
+end
+for _, p in ipairs(Players:GetPlayers()) do addPlayer(p) end
+track(Players.PlayerAdded:Connect(addPlayer))
+track(Players.PlayerRemoving:Connect(function(p)
+    if playerCards[p] then playerCards[p]:Destroy() playerCards[p] = nil end
+end))
+
+---------------------------------------------------------------- SETTINGS PAGE
+local sl = Instance.new("UIListLayout", settingsPage)
+sl.Padding = UDim.new(0, 6)
+
+local function settingsRow(labelText)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -8, 0, 38)
+    row.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    row.Parent = settingsPage
+    corner(row, 8)
+    mkLabel(row, labelText, UDim2.new(0.55, 0, 1, 0), UDim2.new(0, 10, 0, 0), 16)
+    return row
+end
+
+for _, e in ipairs({
+    {"Show / Hide GUI", "ToggleGUI"},
+    {"Fly Up", "FlyUp"},
+    {"Fly Down", "FlyDown"},
+    {"Quick-save location", "QuickSave"},
+    {"Unload script", "Unload"},
+}) do
+    local row = settingsRow(e[1])
+    createBindButton(row, e[2], UDim2.new(0, 120, 0, 28), UDim2.new(1, -128, 0.5, -14))
+end
+
+local function numberRow(labelText, get, set)
+    local row = settingsRow(labelText)
+    local box = mkBox(row, tostring(get()), UDim2.new(0, 120, 0, 28), UDim2.new(1, -128, 0.5, -14))
+    box.TextSize = 18
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then set(math.clamp(n, 1, 500)) end
+        box.Text = tostring(get())
+        save()
+    end)
+end
+numberRow("Fly speed (1-500)", function() return flySpeed end, function(n) flySpeed = n end)
+numberRow("Walk speed (1-500)", function() return walkSpeed end, function(n) walkSpeed = n end)
+
+local resetBtn = mkButton(settingsPage, "Reset keys to default", UDim2.new(1, -8, 0, 38), nil, Color3.fromRGB(120, 60, 40))
+resetBtn.MouseButton1Click:Connect(function()
+    for k, v in pairs(defaults) do binds[k] = v end
+    listening = nil
+    refreshBinds()
+    refreshAll()
+    save()
+end)
+
+local unloadBtn = mkButton(settingsPage, "UNLOAD SCRIPT", UDim2.new(1, -8, 0, 40), nil, Color3.fromRGB(170, 35, 35))
+do
+    local armed = false
+    unloadBtn.MouseButton1Click:Connect(function()
+        if armed then
+            unload()
+            return
+        end
+        armed = true
+        unloadBtn.Text = "Click again to confirm"
+        unloadBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 20)
+        task.delay(3, function()
+            if unloaded then return end
+            armed = false
+            unloadBtn.Text = "UNLOAD SCRIPT"
+            unloadBtn.BackgroundColor3 = Color3.fromRGB(170, 35, 35)
+        end)
+    end)
+end
+
+---------------------------------------------------------------- INPUT
+track(UIS.InputBegan:Connect(function(input, gpe)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if listening then -- rebinding mode
+            local k = input.KeyCode
+            if k == Enum.KeyCode.Escape then
+                -- cancel
+            elseif k == Enum.KeyCode.Backspace then
+                binds[listening] = false
+            else
+                for name, v in pairs(binds) do
+                    if v == k then binds[name] = false end
+                end
+                binds[listening] = k
+            end
+            listening = nil
+            refreshBinds()
+            refreshAll()
+            save()
+            return
+        end
+        if gpe then return end
+
+        local k = input.KeyCode
+        if binds.Unload and k == binds.Unload then unload() return end
+        if binds.ToggleGUI and k == binds.ToggleGUI then setVisible(not frame.Visible) return end
+        if binds.QuickSave and k == binds.QuickSave then saveLocation(nil) return end
+        for _, f in ipairs(features) do
+            if f.toggleKey and binds[f.bind] and k == binds[f.bind] then
+                f.set(not f.get())
+            end
+        end
+
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if gpe or not clickTPEnabled then return end
+        if down(binds.ClickTP) and mouse.Target then
+            teleportTo(mouse.Hit.Position)
+        end
+    end
+end))
+
+---------------------------------------------------------------- START
+pages.Features.Visible = true
+tabButtons.Features.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+refreshBinds()
+refreshAll()

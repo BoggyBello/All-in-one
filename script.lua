@@ -1,6 +1,6 @@
--- All-in-One GUI v4 (with Unload)
+-- All-in-One GUI v5 (per-game saved locations)
 -- Fly / Click TP / No Ragdoll / Noclip / Inf Jump / Godmode / ESP / Speed / Fullbright / Anti-AFK
--- Saved locations + coordinates, rebindable keys, ON/OFF switches, saved config
+-- Saved locations grouped by game, rebindable keys, ON/OFF switches, saved config, Unload
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local RS = game:GetService("RunService")
@@ -8,6 +8,7 @@ local TS = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local Lighting = game:GetService("Lighting")
 local VirtualUser = game:GetService("VirtualUser")
+local MarketplaceService = game:GetService("MarketplaceService")
 local lp = Players.LocalPlayer
 local mouse = lp:GetMouse()
 
@@ -45,6 +46,7 @@ for k, v in pairs(defaults) do binds[k] = v end
 local flySpeed, walkSpeed = 60, 50
 local placeKey = tostring(game.PlaceId)
 local allLocations = {}          -- [placeId] = { {name,x,y,z}, ... }
+local gameNames = {}             -- [placeId] = "Game name"
 local listening = nil
 local refreshers, bindBtns = {}, {}
 local function refreshAll() for _, f in ipairs(refreshers) do f() end end
@@ -54,7 +56,15 @@ local function down(k) return k and UIS:IsKeyDown(k) end
 local function save()
     if not writefile then return end
     pcall(function()
-        local t = {binds = {}, flySpeed = flySpeed, walkSpeed = walkSpeed, locations = allLocations}
+        -- only write games that actually have saved spots
+        local locs, names = {}, {}
+        for k, list in pairs(allLocations) do
+            if type(list) == "table" and #list > 0 then
+                locs[k] = list
+                if gameNames[k] then names[k] = gameNames[k] end
+            end
+        end
+        local t = {binds = {}, flySpeed = flySpeed, walkSpeed = walkSpeed, locations = locs, gameNames = names}
         for k, v in pairs(binds) do t.binds[k] = v and v.Name or "" end
         writefile(FILE, HttpService:JSONEncode(t))
     end)
@@ -76,11 +86,15 @@ if isfile and readfile then
             if tonumber(t.flySpeed) then flySpeed = math.clamp(t.flySpeed, 1, 500) end
             if tonumber(t.walkSpeed) then walkSpeed = math.clamp(t.walkSpeed, 1, 500) end
             if type(t.locations) == "table" then allLocations = t.locations end
+            if type(t.gameNames) == "table" then gameNames = t.gameNames end
         end
     end)
 end
 allLocations[placeKey] = allLocations[placeKey] or {}
-local locations = allLocations[placeKey]
+
+-- which game's spots the Teleport tab is showing
+local viewKey, browsing = placeKey, false
+local function gameName(key) return gameNames[key] or ("Place " .. key) end
 
 ---------------------------------------------------------------- STATE
 local flying, clickTPEnabled, noRagdoll, noclip, infJump = false, true, false, false, false
@@ -413,9 +427,11 @@ local function round1(n) return math.floor(n * 10 + 0.5) / 10 end
 local function saveLocation(name)
     local root = getRoot()
     if not root then return end
+    local list = allLocations[placeKey]
     local p = root.Position
-    if not name or name == "" then name = "Spot " .. (#locations + 1) end
-    table.insert(locations, {name = name, x = round1(p.X), y = round1(p.Y), z = round1(p.Z)})
+    if not name or name == "" then name = "Spot " .. (#list + 1) end
+    table.insert(list, {name = name, x = round1(p.X), y = round1(p.Y), z = round1(p.Z)})
+    viewKey, browsing = placeKey, false      -- always jump back to the current game
     if rebuildLocList then rebuildLocList() end
     save()
 end
@@ -652,6 +668,7 @@ end)
 local tlay = Instance.new("UIListLayout", tpPage)
 tlay.Padding = UDim.new(0, 6)
 
+-- 1) live coords
 local coordRow = Instance.new("Frame")
 coordRow.Size = UDim2.new(1, 0, 0, 32)
 coordRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
@@ -686,6 +703,19 @@ copyBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+-- 2) game header (current game / browse all games)
+local headerRow = Instance.new("Frame")
+headerRow.Size = UDim2.new(1, 0, 0, 32)
+headerRow.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+headerRow.Parent = tpPage
+corner(headerRow, 8)
+local headerLbl = mkLabel(headerRow, "", UDim2.new(1, -104, 1, 0), UDim2.new(0, 10, 0, 0), 15)
+headerLbl.TextWrapped = false
+headerLbl.TextTruncate = Enum.TextTruncate.AtEnd
+local headerBtn = mkButton(headerRow, "All games", UDim2.new(0, 88, 0, 24), UDim2.new(1, -94, 0.5, -12), Color3.fromRGB(0, 110, 170))
+headerBtn.TextSize = 16
+
+-- 3) save current spot
 local saveRow = Instance.new("Frame")
 saveRow.Size = UDim2.new(1, 0, 0, 32)
 saveRow.BackgroundTransparency = 1
@@ -697,6 +727,7 @@ saveBtn.MouseButton1Click:Connect(function()
     nameBox.Text = ""
 end)
 
+-- 4) go to XYZ
 local xyzRow = Instance.new("Frame")
 xyzRow.Size = UDim2.new(1, 0, 0, 32)
 xyzRow.BackgroundTransparency = 1
@@ -710,8 +741,9 @@ goBtn.MouseButton1Click:Connect(function()
     if x and y and z then teleportExact(Vector3.new(x, y, z)) end
 end)
 
+-- 5) list (spots of the viewed game, or the list of all games)
 local locScroll = Instance.new("ScrollingFrame")
-locScroll.Size = UDim2.new(1, 0, 0, 238)
+locScroll.Size = UDim2.new(1, 0, 0, 222)
 locScroll.BackgroundTransparency = 1
 locScroll.BorderSizePixel = 0
 locScroll.ScrollBarThickness = 5
@@ -722,11 +754,66 @@ local ll = Instance.new("UIListLayout", locScroll)
 ll.Padding = UDim.new(0, 5)
 ll.SortOrder = Enum.SortOrder.LayoutOrder
 
+local function sortedGameKeys()
+    local keys = {}
+    for k, list in pairs(allLocations) do
+        if type(list) == "table" and (#list > 0 or k == placeKey) then keys[#keys + 1] = k end
+    end
+    table.sort(keys, function(a, b)
+        if a == b then return false end
+        if a == placeKey then return true end
+        if b == placeKey then return false end
+        return gameName(a):lower() < gameName(b):lower()
+    end)
+    return keys
+end
+
 rebuildLocList = function()
     for _, c in ipairs(locScroll:GetChildren()) do
         if c:IsA("Frame") then c:Destroy() end
     end
-    for i, loc in ipairs(locations) do
+
+    local viewList = allLocations[viewKey] or {}
+    local isHere = (not browsing) and viewKey == placeKey
+
+    -- header + which rows are visible
+    if browsing then
+        headerLbl.Text = "All games with saved spots"
+    elseif isHere then
+        headerLbl.Text = ("%s  (%d)"):format(gameName(placeKey), #viewList)
+    else
+        headerLbl.Text = ("%s  (%d) - other game"):format(gameName(viewKey), #viewList)
+    end
+    headerBtn.Text = browsing and "Back" or "All games"
+    saveRow.Visible = isHere
+    xyzRow.Visible = isHere
+
+    -- list of games
+    if browsing then
+        for i, key in ipairs(sortedGameKeys()) do
+            local list = allLocations[key]
+            local card = Instance.new("Frame")
+            card.Size = UDim2.new(1, -8, 0, 36)
+            card.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+            card.LayoutOrder = i
+            card.Parent = locScroll
+            corner(card, 6)
+            local nl = mkLabel(card, ("%s  (%d)%s"):format(gameName(key), #list, key == placeKey and "  - you are here" or ""),
+                UDim2.new(1, -70, 1, 0), UDim2.new(0, 8, 0, 0), 14)
+            nl.TextWrapped = false
+            nl.TextTruncate = Enum.TextTruncate.AtEnd
+            local open = mkButton(card, "Open", UDim2.new(0, 54, 0, 26), UDim2.new(1, -60, 0.5, -13), Color3.fromRGB(0, 110, 170))
+            open.TextSize = 16
+            open.MouseButton1Click:Connect(function()
+                viewKey, browsing = key, false
+                rebuildLocList()
+            end)
+        end
+        return
+    end
+
+    -- spots of the viewed game
+    for i, loc in ipairs(viewList) do
         local card = Instance.new("Frame")
         card.Size = UDim2.new(1, -8, 0, 36)
         card.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
@@ -734,18 +821,36 @@ rebuildLocList = function()
         card.Parent = locScroll
         corner(card, 6)
         local nl = mkLabel(card, ("%s  (%.0f, %.0f, %.0f)"):format(loc.name, loc.x, loc.y, loc.z),
-            UDim2.new(1, -100, 1, 0), UDim2.new(0, 8, 0, 0), 14)
+            UDim2.new(1, isHere and -100 or -52, 1, 0), UDim2.new(0, 8, 0, 0), 14)
+        nl.TextWrapped = false
         nl.TextTruncate = Enum.TextTruncate.AtEnd
-        local go = mkButton(card, "TP", UDim2.new(0, 40, 0, 26), UDim2.new(1, -88, 0.5, -13), Color3.fromRGB(0, 150, 75))
+        if isHere then -- TP only makes sense inside the same game
+            local go = mkButton(card, "TP", UDim2.new(0, 40, 0, 26), UDim2.new(1, -88, 0.5, -13), Color3.fromRGB(0, 150, 75))
+            go.MouseButton1Click:Connect(function() teleportExact(Vector3.new(loc.x, loc.y, loc.z)) end)
+        end
         local del = mkButton(card, "X", UDim2.new(0, 34, 0, 26), UDim2.new(1, -44, 0.5, -13), Color3.fromRGB(170, 45, 45))
-        go.MouseButton1Click:Connect(function() teleportExact(Vector3.new(loc.x, loc.y, loc.z)) end)
         del.MouseButton1Click:Connect(function()
-            table.remove(locations, i)
+            local list = allLocations[viewKey]
+            if not list then return end
+            table.remove(list, i)
+            if #list == 0 and viewKey ~= placeKey then
+                allLocations[viewKey] = nil
+                browsing = true
+            end
             rebuildLocList()
             save()
         end)
     end
 end
+
+headerBtn.MouseButton1Click:Connect(function()
+    if browsing then
+        browsing, viewKey = false, placeKey
+    else
+        browsing = true
+    end
+    rebuildLocList()
+end)
 rebuildLocList()
 
 ---------------------------------------------------------------- PLAYERS PAGE
@@ -898,3 +1003,26 @@ pages.Features.Visible = true
 tabButtons.Features.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
 refreshBinds()
 refreshAll()
+
+-- fetch real game names in the background (current game + every game with saved spots)
+task.spawn(function()
+    local keys = {}
+    for k in pairs(allLocations) do
+        local n = tonumber(k)
+        if n and n > 0 and not gameNames[k] then keys[#keys + 1] = k end
+    end
+    local changed = false
+    for _, k in ipairs(keys) do
+        if unloaded then return end
+        local ok, info = pcall(function() return MarketplaceService:GetProductInfo(tonumber(k)) end)
+        if ok and type(info) == "table" and info.Name then
+            gameNames[k] = info.Name
+            changed = true
+        end
+        task.wait(0.2)
+    end
+    if changed and not unloaded then
+        save()
+        if rebuildLocList then rebuildLocList() end
+    end
+end)
